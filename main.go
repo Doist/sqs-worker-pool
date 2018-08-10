@@ -304,6 +304,7 @@ func (p *workerPool) signal(s os.Signal) int {
 func (p *workerPool) start() error {
 	cmd := exec.Command(p.bin, p.name, p.url)
 	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url)
+	cmd.SysProcAttr = procAttr()
 	begin := time.Now()
 	if err := cmd.Start(); err != nil {
 		return err
