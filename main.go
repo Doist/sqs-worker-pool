@@ -44,6 +44,7 @@ import (
 
 	"github.com/artyom/autoflags"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
@@ -144,20 +145,12 @@ func handleQueues(ctx context.Context, svc *sqs.SQS, args runArgs, queues []stri
 	if len(queues) == 0 {
 		return errors.New("empty queue list")
 	}
-	var pools []*workerPool
+	var g errgroup.Group
 	for _, url := range queues {
 		p := newPool(args.Executable, url)
-		go p.loop(ctx, svc, time.Minute, args.MaxWorkers, args.WorkerLoad)
-		pools = append(pools, p)
 		p.logf("worker pool for %q", url)
-	}
-	<-ctx.Done()
-	var g errgroup.Group
-	for _, p := range pools {
-		p := p
 		g.Go(func() error {
-			p.terminate(context.Background(), 3*time.Second)
-			return nil
+			return p.loop(ctx, svc, time.Minute, args.MaxWorkers, args.WorkerLoad)
 		})
 	}
 	return g.Wait()
@@ -184,8 +177,11 @@ func queueList(ctx context.Context, svc *sqs.SQS, prefix string) ([]string, erro
 }
 
 func newPool(bin, url string) *workerPool {
-	p := &workerPool{bin: bin, url: url}
-	p.once.Do(p.init)
+	p := &workerPool{bin: bin, url: url,
+		procs: make(map[uint64]*exec.Cmd)}
+	if i := strings.LastIndexByte(p.url, '/'); i >= 0 {
+		p.name = p.url[i+1:]
+	}
 	return p
 }
 
@@ -195,8 +191,7 @@ type workerPool struct {
 	url  string // SQS queue url
 	name string // SQS queue name (url part after final /)
 
-	nextpid uint64    // internal pid counter, incremented with atomics
-	once    sync.Once // guards init method
+	nextpid uint64 // internal pid counter, incremented with atomics
 
 	mu    sync.Mutex
 	procs map[uint64]*exec.Cmd // keyed by internal pid
@@ -208,8 +203,11 @@ type workerPool struct {
 // will shutdown when they got no job for a while. Target number of workers in
 // a pool is calculated as queueSize / workerLoad, but capped to maxWorkers. For
 // non-empty queue, target number is always in [1, maxWorkers] range.
-func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, maxWorkers, workerLoad int) {
-	p.once.Do(p.init)
+//
+// It returns either when ctx is canceled or it finds out that queue does not
+// exist. It terminates all workers before returning.
+func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, maxWorkers, workerLoad int) error {
+	defer p.terminate(context.Background(), 3*time.Second)
 	stub := make(chan struct{})
 	close(stub) // to unblock first iteration early
 	ticker := time.NewTicker(d)
@@ -217,7 +215,7 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 		case <-stub:
 		}
@@ -226,6 +224,9 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 		}
 		size, err := qSize(ctx, svc, p.url)
 		if err != nil {
+			if isNotExist(err) {
+				return err
+			}
 			p.logf("%q queue size error: %v", p.name, err)
 			continue
 		}
@@ -248,16 +249,6 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 			}
 		}
 	}
-}
-
-// init initializes workerPool fields; its call must be guarded by p.once
-func (p *workerPool) init() {
-	if i := strings.LastIndexByte(p.url, '/'); i >= 0 {
-		p.name = p.url[i+1:]
-	}
-	p.mu.Lock()
-	p.procs = make(map[uint64]*exec.Cmd)
-	p.mu.Unlock()
 }
 
 // size returns number of currently registered processes in a pool. This will
@@ -311,7 +302,6 @@ func (p *workerPool) signal(s os.Signal) int {
 // Process is started with SQS queue name as its first argument and queue url as
 // a second argument; they also passed via environment as "NAME" and "URL".
 func (p *workerPool) start() error {
-	p.once.Do(p.init)
 	cmd := exec.Command(p.bin, p.name, p.url)
 	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url)
 	begin := time.Now()
@@ -378,4 +368,10 @@ func qSize(ctx context.Context, svc *sqs.SQS, url string) (int, error) {
 		return 0, errors.New("no required attribute in GetQueueAttributes response")
 	}
 	return strconv.Atoi(*val)
+}
+
+// isNotExist returns true if error signals that queue does not exist
+func isNotExist(err error) bool {
+	aerr, ok := err.(awserr.Error)
+	return ok && aerr.Code() == sqs.ErrCodeQueueDoesNotExist
 }
