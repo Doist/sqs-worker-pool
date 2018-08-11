@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -143,6 +144,11 @@ func run(ctx context.Context, args runArgs) error {
 		p := newPool(args.Executable, url)
 		p.logf("worker pool for %q", url)
 		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Duration(rand.Intn(2000)) * time.Millisecond):
+			}
 			return p.loop(ctx, svc, time.Minute, args.MaxWorkers, args.WorkerLoad)
 		})
 	}
@@ -205,14 +211,12 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 	close(stub) // to unblock first iteration early
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
-	for i := 0; ; i++ {
+	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-		case <-stub:
-		}
-		if i == 0 {
+		case <-stub: // initial iteration
 			stub = nil // nil chan blocks forever
 		}
 		size, err := qSize(ctx, svc, p.url)
