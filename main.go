@@ -135,13 +135,6 @@ func run(ctx context.Context, args runArgs) error {
 		}
 		return nil
 	}
-	return handleQueues(ctx, svc, args, queues)
-}
-
-// handleQueues starts workerPool for each queue and blocks until ctx is
-// canceled. Once ctx is canceled, all workers are terminated and function
-// returns.
-func handleQueues(ctx context.Context, svc *sqs.SQS, args runArgs, queues []string) error {
 	if len(queues) == 0 {
 		return errors.New("empty queue list")
 	}
