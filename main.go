@@ -238,7 +238,7 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 			cnt = 1
 		}
 		need := cnt - p.size()
-		if need == 0 {
+		if need <= 0 {
 			continue
 		}
 		p.logf("%q queue size is ≈ %d, starting %d workers", p.name, size, need)
