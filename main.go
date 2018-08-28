@@ -139,9 +139,27 @@ func run(ctx context.Context, args runArgs) error {
 	if len(queues) == 0 {
 		return errors.New("empty queue list")
 	}
+	var stderr atomic.Value // []byte of stderr of the last failed command
 	var g errgroup.Group
+	g.Go(func() error {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGUSR1)
+		defer signal.Stop(ch)
+		const format = "last non-empty stderr of a failed command:\n%s"
+		for {
+			select {
+			case <-ch:
+				if val := stderr.Load(); val != nil {
+					log.Printf(format, val.([]byte))
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
 	for _, url := range queues {
 		p := newPool(args.Executable, url)
+		p.saveStderr = func(b []byte) { stderr.Store(b) }
 		p.logf("worker pool for %q", url)
 		g.Go(func() error {
 			select {
@@ -191,6 +209,10 @@ type workerPool struct {
 	name string // SQS queue name (url part after final /)
 
 	nextpid uint64 // internal pid counter, incremented with atomics
+
+	// called for command's stderr, if command exits with error, has
+	// non-empty stderr and this function is not nil
+	saveStderr func([]byte)
 
 	mu    sync.Mutex
 	procs map[uint64]*exec.Cmd // keyed by internal pid
@@ -305,6 +327,9 @@ func (p *workerPool) start() error {
 	cmd := exec.Command(p.bin, p.name, p.url)
 	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url)
 	cmd.SysProcAttr = procAttr()
+	if p.saveStderr != nil {
+		cmd.Stderr = &prefixSuffixSaver{N: 32 << 10}
+	}
 	begin := time.Now()
 	if err := cmd.Start(); err != nil {
 		return err
@@ -317,6 +342,10 @@ func (p *workerPool) start() error {
 		if err := cmd.Wait(); err != nil {
 			p.logf("queue %q worker exit %v since start: %v", p.name,
 				time.Since(begin).Truncate(time.Millisecond), err)
+			if s, ok := cmd.Stderr.(*prefixSuffixSaver); ok &&
+				s.prefix != nil && p.saveStderr != nil {
+				p.saveStderr(s.Bytes())
+			}
 		}
 		p.mu.Lock()
 		defer p.mu.Unlock()
