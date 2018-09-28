@@ -263,7 +263,11 @@ func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, ma
 		if need <= 0 {
 			continue
 		}
-		p.logf("%q queue size is ≈ %d, starting %d worker(s)", p.name, size, need)
+		s := "" // plural -s suffix
+		if need > 1 {
+			s = "s"
+		}
+		p.logf("%q queue size is ≈ %d, starting %d worker%s", p.name, size, need, s)
 		for i := 0; i < need; i++ {
 			if err := p.start(); err != nil {
 				p.logf("error starting %q queue worker: %v", p.name, err)
