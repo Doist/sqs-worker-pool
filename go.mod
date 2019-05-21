@@ -1,4 +1,4 @@
-module github.com/artyom/sqs-worker-pool
+module github.com/Doist/sqs-worker-pool
 
 require (
 	github.com/artyom/autoflags v1.1.0

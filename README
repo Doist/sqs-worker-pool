@@ -1,4 +1,4 @@
 Program sqs-worker-pool starts multiple worker processes for each matching
 SQS queue depending on queue depth.
 
-For details see https://godoc.org/github.com/artyom/sqs-worker-pool
+For details see https://godoc.org/github.com/Doist/sqs-worker-pool
