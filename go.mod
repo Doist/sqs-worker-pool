@@ -1,7 +1,7 @@
 module github.com/Doist/sqs-worker-pool
 
 require (
-	github.com/artyom/autoflags v1.1.0
+	github.com/artyom/autoflags v1.1.1
 	github.com/aws/aws-sdk-go v1.28.10
 	github.com/davecgh/go-spew v1.1.0 // indirect
 	github.com/gopherjs/gopherjs v0.0.0-20180628210949-0892b62f0d9f // indirect
