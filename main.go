@@ -58,6 +58,9 @@ func main() {
 		WorkerLoad: 1000,
 	}
 	autoflags.Parse(&args)
+	if os.Getenv("AWS_EXECUTION_ENV") != "" {
+		log.SetFlags(0)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {

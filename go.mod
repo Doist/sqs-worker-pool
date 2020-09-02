@@ -1,5 +1,7 @@
 module github.com/Doist/sqs-worker-pool
 
+go 1.15
+
 require (
 	github.com/artyom/autoflags v1.1.1
 	github.com/aws/aws-sdk-go v1.28.10
