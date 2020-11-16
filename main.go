@@ -83,6 +83,7 @@ type runArgs struct {
 	MaxWorkers int    `flag:"max-workers,maximum number of workers to run per queue"`
 	WorkerLoad int    `flag:"worker-load,number of jobs single worker can process over poll cycle"`
 	ListOnly   bool   `flag:"list,only print matching queue urls to stdout and exit"`
+	Verbose    bool   `flag:"verbose,don't suppress workers' stdout/stderr"`
 }
 
 func (a *runArgs) check() error {
@@ -162,6 +163,7 @@ func run(ctx context.Context, args runArgs) error {
 	})
 	for _, url := range queues {
 		p := newPool(args.Executable, url)
+		p.verbose = args.Verbose
 		p.saveStderr = func(b []byte) { stderr.Store(b) }
 		p.logf("worker pool for %q", url)
 		g.Go(func() error {
@@ -216,6 +218,8 @@ type workerPool struct {
 	// called for command's stderr, if command exits with error, has
 	// non-empty stderr and this function is not nil
 	saveStderr func([]byte)
+
+	verbose bool // whether to connect workers' stdout/stderr to os.Stdout/Stderr
 
 	mu    sync.Mutex
 	procs map[uint64]*exec.Cmd // keyed by internal pid
@@ -334,7 +338,10 @@ func (p *workerPool) start() error {
 	cmd := exec.Command(p.bin, p.name, p.url)
 	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url)
 	cmd.SysProcAttr = procAttr()
-	if p.saveStderr != nil {
+	if p.verbose {
+		cmd.Stderr, cmd.Stdout = os.Stderr, os.Stdout
+	}
+	if !p.verbose && p.saveStderr != nil {
 		cmd.Stderr = &prefixSuffixSaver{N: 32 << 10}
 	}
 	begin := time.Now()
