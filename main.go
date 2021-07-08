@@ -44,11 +44,10 @@ import (
 	"time"
 
 	"github.com/artyom/autoflags"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -120,15 +119,15 @@ func run(ctx context.Context, args runArgs) error {
 			return err
 		}
 	}
-	sess, err := session.NewSession()
+
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return err
 	}
-	awsConfig := aws.NewConfig()
-	if meta, err := ec2metadata.New(sess).GetInstanceIdentityDocument(); err == nil {
-		awsConfig = awsConfig.WithRegion(meta.Region)
+	if out, err := imds.NewFromConfig(cfg).GetRegion(ctx, nil); err == nil {
+		cfg.Region = out.Region
 	}
-	svc := sqs.New(sess, awsConfig)
+	svc := sqs.NewFromConfig(cfg)
 	queues, err := queueList(ctx, svc, prefix)
 	if err != nil {
 		return err
@@ -179,21 +178,19 @@ func run(ctx context.Context, args runArgs) error {
 }
 
 // queueList returns urls of every SQS queue which name starts with prefix
-func queueList(ctx context.Context, svc *sqs.SQS, prefix string) ([]string, error) {
+func queueList(ctx context.Context, svc *sqs.Client, prefix string) ([]string, error) {
 	input := &sqs.ListQueuesInput{}
 	if prefix != "" {
 		input.QueueNamePrefix = &prefix
 	}
-	resp, err := svc.ListQueuesWithContext(ctx, input)
-	if err != nil {
-		return nil, err
-	}
 	var queues []string
-	for _, u := range resp.QueueUrls {
-		if u == nil {
-			continue
+	p := sqs.NewListQueuesPaginator(svc, input)
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
 		}
-		queues = append(queues, *u)
+		queues = append(queues, page.QueueUrls...)
 	}
 	return queues, nil
 }
@@ -234,7 +231,7 @@ type workerPool struct {
 //
 // It returns either when ctx is canceled or it finds out that queue does not
 // exist. It terminates all workers before returning.
-func (p *workerPool) loop(ctx context.Context, svc *sqs.SQS, d time.Duration, maxWorkers, workerLoad int) error {
+func (p *workerPool) loop(ctx context.Context, svc *sqs.Client, d time.Duration, maxWorkers, workerLoad int) error {
 	defer p.terminate(context.Background(), 3*time.Second)
 	stub := make(chan struct{})
 	close(stub) // to unblock first iteration early
@@ -396,26 +393,26 @@ func filterQueues(queues []string, reInclude, reExclude *regexp.Regexp) []string
 	return out
 }
 
-func qSize(ctx context.Context, svc *sqs.SQS, url string) (int, error) {
+func qSize(ctx context.Context, svc *sqs.Client, url string) (int, error) {
 	input := &sqs.GetQueueAttributesInput{
-		AttributeNames: []*string{
-			aws.String(sqs.QueueAttributeNameApproximateNumberOfMessages),
+		AttributeNames: []types.QueueAttributeName{
+			types.QueueAttributeNameApproximateNumberOfMessages,
 		},
 		QueueUrl: &url,
 	}
-	res, err := svc.GetQueueAttributesWithContext(ctx, input)
+	res, err := svc.GetQueueAttributes(ctx, input)
 	if err != nil {
 		return 0, err
 	}
-	val, ok := res.Attributes[sqs.QueueAttributeNameApproximateNumberOfMessages]
+	val, ok := res.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)]
 	if !ok {
 		return 0, errors.New("no required attribute in GetQueueAttributes response")
 	}
-	return strconv.Atoi(*val)
+	return strconv.Atoi(val)
 }
 
 // isNotExist returns true if error signals that queue does not exist
 func isNotExist(err error) bool {
-	aerr, ok := err.(awserr.Error)
-	return ok && aerr.Code() == sqs.ErrCodeQueueDoesNotExist
+	var errNotExists *types.QueueDoesNotExist
+	return errors.As(err, &errNotExists)
 }
