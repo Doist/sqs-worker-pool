@@ -169,6 +169,13 @@ func run(ctx context.Context, args runArgs) error {
 			return err
 		}
 		g.Go(hh.run)
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				hh.close()
+				return nil
+			}
+		})
 	}
 	g.Go(func() error {
 		ch := make(chan os.Signal, 1)
@@ -488,7 +495,8 @@ type healthcheckHandler struct {
 	mu    sync.Mutex
 	pools []*workerPool // all worker pools handled by the healthcheck
 
-	l net.Listener // listener for the healthcheck socket
+	stopped bool
+	l       net.Listener // listener for the healthcheck socket
 }
 
 // newHealthcheckHandler creates a new healthcheck handler
@@ -502,6 +510,7 @@ func newHealthcheckHandler(socket string) (*healthcheckHandler, error) {
 
 // close closes the healthcheck listener
 func (h *healthcheckHandler) close() error {
+	h.stopped = true
 	return h.l.Close()
 }
 
@@ -534,6 +543,9 @@ func (h *healthcheckHandler) run() error {
 	for {
 		conn, err := h.l.Accept()
 		if err != nil {
+			if opErr, ok := err.(*net.OpError); ok && h.stopped && opErr.Unwrap() == net.ErrClosed {
+				return nil
+			}
 			return err
 		}
 		go h.handleConn(conn)
