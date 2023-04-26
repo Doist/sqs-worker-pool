@@ -199,12 +199,17 @@ func newPool(bin, url string) *workerPool {
 	p := &workerPool{
 		bin:   bin,
 		url:   url,
-		procs: make(map[int]*exec.Cmd),
+		procs: make(map[int]*poolProc),
 	}
 	if i := strings.LastIndexByte(p.url, '/'); i >= 0 {
 		p.name = p.url[i+1:]
 	}
 	return p
+}
+
+// poolProc tracks a single worker process
+type poolProc struct {
+	cmd *exec.Cmd
 }
 
 // workerPool tracks workers for a single queue
@@ -220,7 +225,7 @@ type workerPool struct {
 	verbose bool // whether to connect workers' stdout/stderr to os.Stdout/Stderr
 
 	mu    sync.Mutex
-	procs map[int]*exec.Cmd // keyed by worker PID
+	procs map[int]*poolProc // keyed by worker PID
 }
 
 // loop blocks until ctx is canceled, checking number of jobs in queue every
@@ -317,11 +322,11 @@ func (p *workerPool) signal(s os.Signal) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var cnt int
-	for _, cmd := range p.procs {
-		if cmd.Process == nil {
+	for _, proc := range p.procs {
+		if proc.cmd.Process == nil {
 			continue
 		}
-		cmd.Process.Signal(s)
+		proc.cmd.Process.Signal(s)
 		cnt++
 	}
 	return cnt
@@ -349,7 +354,7 @@ func (p *workerPool) start() error {
 	pid := cmd.Process.Pid
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.procs[pid] = cmd
+	p.procs[pid] = &poolProc{cmd}
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			p.logf("queue %q worker exit %v since start: %v", p.name,
