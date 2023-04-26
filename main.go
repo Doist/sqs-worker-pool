@@ -219,7 +219,8 @@ func newPool(bin, url string) *workerPool {
 
 // poolProc tracks a single worker process
 type poolProc struct {
-	cmd *exec.Cmd
+	isHealthy bool // whether the worker reported as healthy
+	cmd       *exec.Cmd
 }
 
 // workerPool tracks workers for a single queue
@@ -368,7 +369,7 @@ func (p *workerPool) start() error {
 	pid := cmd.Process.Pid
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.procs[pid] = &poolProc{cmd}
+	p.procs[pid] = &poolProc{false, cmd}
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			p.logf("queue %q worker exit %v since start: %v", p.name,
@@ -383,6 +384,31 @@ func (p *workerPool) start() error {
 		delete(p.procs, pid)
 	}()
 	return nil
+}
+
+// isHealthy checks if a worker pool is healthy; that is, all its current
+// running processes signaled as healthy.
+func (p *workerPool) isHealthy() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, proc := range p.procs {
+		if !proc.isHealthy {
+			return false
+		}
+	}
+	return true
+}
+
+// setHealthy marks one process as healthy/unhealthy by PID.
+//
+// If the PID isn't found in that pool, this does nothing.
+func (p *workerPool) setHealthy(pid int, healthy bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	proc, ok := p.procs[pid]
+	if ok && proc != nil {
+		proc.isHealthy = healthy
+	}
 }
 
 // filterQueues filters SQS queue urls by matching their names (final url
