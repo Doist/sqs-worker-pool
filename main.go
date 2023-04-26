@@ -22,6 +22,14 @@
 // Upon receiving INT or TERM signals, program tries gracefully shutting down
 // all running workers by sending them TERM first, and KILL 3 seconds later.
 //
+// This program can also manage simple health checks for worker processes. This
+// is done by listening to a Unix socket, specified by the -healthcheck-socket
+// argument, and responding to simple commands. When enabled, that value is also
+// passed to worker processes via the HEALTHCHECK_SOCKET environment variable.
+// Processes that don't explicitly report their status are considered unhealthy.
+// On the Unix socket, each command must end with a newline, and will get
+// a response ending with a newline too.
+//
 // sqs-worker-pool is built using AWS SDK, so it looks up required credentials
 // in a usual way: via local confgiuration, environment variables, IAM role.
 package main
@@ -76,13 +84,14 @@ func main() {
 }
 
 type runArgs struct {
-	Executable string `flag:"worker,path to worker executable"`
-	Include    string `flag:"include,regex of queue names to include, empty matches all"`
-	Exclude    string `flag:"exclude,regex of queue names to exclude, empty matches none"`
-	MaxWorkers int    `flag:"max-workers,maximum number of workers to run per queue"`
-	WorkerLoad int    `flag:"worker-load,number of jobs single worker can process over poll cycle"`
-	ListOnly   bool   `flag:"list,only print matching queue urls to stdout and exit"`
-	Verbose    bool   `flag:"verbose,don't suppress workers' stdout/stderr"`
+	Executable        string `flag:"worker,path to worker executable"`
+	Include           string `flag:"include,regex of queue names to include, empty matches all"`
+	Exclude           string `flag:"exclude,regex of queue names to exclude, empty matches none"`
+	MaxWorkers        int    `flag:"max-workers,maximum number of workers to run per queue"`
+	WorkerLoad        int    `flag:"worker-load,number of jobs single worker can process over poll cycle"`
+	ListOnly          bool   `flag:"list,only print matching queue urls to stdout and exit"`
+	Verbose           bool   `flag:"verbose,don't suppress workers' stdout/stderr"`
+	HealthcheckSocket string `flag:"healthcheck-socket,Unix socket used for health checks"`
 }
 
 func (a *runArgs) check() error {
@@ -163,6 +172,7 @@ func run(ctx context.Context, args runArgs) error {
 	for _, url := range queues {
 		p := newPool(args.Executable, url)
 		p.verbose = args.Verbose
+		p.healthcheckSocket = args.HealthcheckSocket
 		p.saveStderr = func(b []byte) { stderr.Store(b) }
 		p.logf("worker pool for %q", url)
 		g.Go(func() error {
@@ -226,6 +236,8 @@ type workerPool struct {
 
 	mu    sync.Mutex
 	procs map[int]*poolProc // keyed by worker PID
+
+	healthcheckSocket string // unix socket used for health checks
 }
 
 // loop blocks until ctx is canceled, checking number of jobs in queue every
@@ -336,10 +348,12 @@ func (p *workerPool) signal(s os.Signal) int {
 // finishes, it is automatically removed from the pool.
 //
 // Process is started with SQS queue name as its first argument and queue url as
-// a second argument; they also passed via environment as "NAME" and "URL".
+// a second argument; they also passed via environment as "NAME" and "URL". The
+// path to the healthcheck socket is also passed via environment as
+// "HEALTHCHECK_SOCKET".
 func (p *workerPool) start() error {
 	cmd := exec.Command(p.bin, p.name, p.url)
-	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url)
+	cmd.Env = append(os.Environ(), "NAME="+p.name, "URL="+p.url, "HEALTHCHECK_SOCKET="+p.healthcheckSocket)
 	cmd.SysProcAttr = procAttr()
 	if p.verbose {
 		cmd.Stderr, cmd.Stdout = os.Stderr, os.Stdout
