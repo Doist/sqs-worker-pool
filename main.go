@@ -30,16 +30,25 @@
 // On the Unix socket, each command must end with a newline, and will get
 // a response ending with a newline too.
 //
+// Supported commands:
+//   - "SET <pid>": marks process as healthy by PID; response: "OK"
+//   - "UNSET <pid>": marks process as unhealthy by PID; response: "OK"
+//   - "CHECK": checks if all managed processes are healthy; response:
+//     "OK <ok>/<total>" if all processes are healthy, "KO <ok>/<total>" if at
+//     least one process is unhealthy.
+//
 // sqs-worker-pool is built using AWS SDK, so it looks up required credentials
 // in a usual way: via local confgiuration, environment variables, IAM role.
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -151,8 +160,16 @@ func run(ctx context.Context, args runArgs) error {
 	if len(queues) == 0 {
 		return errors.New("empty queue list")
 	}
+	var hh *healthcheckHandler
 	var stderr atomic.Value // []byte of stderr of the last failed command
 	var g errgroup.Group
+	if args.HealthcheckSocket != "" {
+		hh, err = newHealthcheckHandler(args.HealthcheckSocket)
+		if err != nil {
+			return err
+		}
+		g.Go(hh.run)
+	}
 	g.Go(func() error {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGUSR1)
@@ -173,6 +190,9 @@ func run(ctx context.Context, args runArgs) error {
 		p := newPool(args.Executable, url)
 		p.verbose = args.Verbose
 		p.healthcheckSocket = args.HealthcheckSocket
+		if hh != nil {
+			hh.addPool(p)
+		}
 		p.saveStderr = func(b []byte) { stderr.Store(b) }
 		p.logf("worker pool for %q", url)
 		g.Go(func() error {
@@ -461,4 +481,127 @@ func qSize(ctx context.Context, svc *sqs.Client, url string) (int, error) {
 func isNotExist(err error) bool {
 	var errNotExists *types.QueueDoesNotExist
 	return errors.As(err, &errNotExists)
+}
+
+// healthcheckHandler handles requests to the healthcheck socket
+type healthcheckHandler struct {
+	mu    sync.Mutex
+	pools []*workerPool // all worker pools handled by the healthcheck
+
+	l net.Listener // listener for the healthcheck socket
+}
+
+// newHealthcheckHandler creates a new healthcheck handler
+func newHealthcheckHandler(socket string) (*healthcheckHandler, error) {
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	return &healthcheckHandler{l: l}, nil
+}
+
+// close closes the healthcheck listener
+func (h *healthcheckHandler) close() error {
+	return h.l.Close()
+}
+
+// addPool adds a new worker pool to the healthcheck handler
+func (h *healthcheckHandler) addPool(pool *workerPool) {
+	if pool == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pools = append(h.pools, pool)
+}
+
+// isHealthy checks if all handler worker pools are healthy
+func (h *healthcheckHandler) isHealthy() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, pool := range h.pools {
+		if !pool.isHealthy() {
+			return false
+		}
+	}
+	return true
+}
+
+// run handles incoming connection on the healthcheck socket.
+//
+// This runs forever, and should be run in a goroutine.
+func (h *healthcheckHandler) run() error {
+	for {
+		conn, err := h.l.Accept()
+		if err != nil {
+			return err
+		}
+		go h.handleConn(conn)
+	}
+}
+
+// handleConn handles one incoming connection on the healthcheck socket.
+func (h *healthcheckHandler) handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		cmd := scanner.Text()
+		words := strings.Fields(cmd)
+		if len(words) == 0 {
+			continue
+		}
+
+		resp := "KO" // default response: something is wrong
+		switch words[0] {
+		case "CHECK":
+			resp = h.handleCheckCommand()
+		case "SET", "UNSET":
+			resp = h.handleSetUnsetCommands(words)
+		}
+		fmt.Fprintln(conn, resp)
+		return
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("healthcheck: %v", err)
+	}
+}
+
+// handleCheckCommand runs the "CHECK" command
+func (h *healthcheckHandler) handleCheckCommand() string {
+	total, ok := 0, 0
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, pool := range h.pools {
+		total += 1
+		if pool.isHealthy() {
+			ok += 1
+		}
+	}
+	if ok == total {
+		return fmt.Sprintf("OK %d/%d", ok, total)
+	}
+	return fmt.Sprintf("KO %d/%d", ok, total)
+}
+
+// handleSetUnsetCommands runs the the "SET" and "UNSET" commands
+func (h *healthcheckHandler) handleSetUnsetCommands(words []string) string {
+	cmd := words[0]
+	healthy := (cmd == "SET")
+	if len(words) < 2 {
+		log.Printf("healthechk[%s]: got %d arguments", cmd, len(words)-1)
+		return "KO"
+	}
+	pid, err := strconv.Atoi(words[1])
+	if err != nil {
+		log.Printf("healthcheck[%s]: %v", cmd, err)
+		return "KO"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, pool := range h.pools {
+		pool.setHealthy(pid, healthy)
+	}
+	return "OK"
 }
