@@ -196,8 +196,11 @@ func queueList(ctx context.Context, svc *sqs.Client, prefix string) ([]string, e
 }
 
 func newPool(bin, url string) *workerPool {
-	p := &workerPool{bin: bin, url: url,
-		procs: make(map[uint64]*exec.Cmd)}
+	p := &workerPool{
+		bin:   bin,
+		url:   url,
+		procs: make(map[int]*exec.Cmd),
+	}
 	if i := strings.LastIndexByte(p.url, '/'); i >= 0 {
 		p.name = p.url[i+1:]
 	}
@@ -210,8 +213,6 @@ type workerPool struct {
 	url  string // SQS queue url
 	name string // SQS queue name (url part after final /)
 
-	nextpid uint64 // internal pid counter, incremented with atomics
-
 	// called for command's stderr, if command exits with error, has
 	// non-empty stderr and this function is not nil
 	saveStderr func([]byte)
@@ -219,7 +220,7 @@ type workerPool struct {
 	verbose bool // whether to connect workers' stdout/stderr to os.Stdout/Stderr
 
 	mu    sync.Mutex
-	procs map[uint64]*exec.Cmd // keyed by internal pid
+	procs map[int]*exec.Cmd // keyed by worker PID
 }
 
 // loop blocks until ctx is canceled, checking number of jobs in queue every
@@ -345,7 +346,7 @@ func (p *workerPool) start() error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	pid := atomic.AddUint64(&p.nextpid, 1)
+	pid := cmd.Process.Pid
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.procs[pid] = cmd
